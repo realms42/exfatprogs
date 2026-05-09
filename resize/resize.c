@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <locale.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -41,16 +42,22 @@ static long long parse_size(const char *s)
 {
 	char *unit;
 	unsigned long long v = strtoull(s, &unit, 0);
+	unsigned int shift;
 
 	switch (*unit) {
-	case 'G': case 'g': v <<= 30; break;
-	case 'M': case 'm': v <<= 20; break;
-	case 'K': case 'k': v <<= 10; break;
-	case '\0': break;
+	case 'G': case 'g': shift = 30; break;
+	case 'M': case 'm': shift = 20; break;
+	case 'K': case 'k': shift = 10; break;
+	case '\0': shift = 0; break;
 	default:
 		exfat_err("unknown size unit '%c'\n", *unit);
 		return -EINVAL;
 	}
+	if (shift && v > (ULLONG_MAX >> shift)) {
+		exfat_err("size value overflows\n");
+		return -EINVAL;
+	}
+	v <<= shift;
 	return (long long)v;
 }
 
@@ -485,7 +492,7 @@ int main(int argc, char *argv[])
 
 	show_version();
 	if (version_only)
-		exit(EXIT_FAILURE);
+		exit(EXIT_SUCCESS);
 
 	if (argc - optind != 2)
 		usage();
@@ -517,7 +524,14 @@ int main(int argc, char *argv[])
 	fat_offset_sect  = le32_to_cpu(bs->bsx.fat_offset);
 	clu_offset_sect  = le32_to_cpu(bs->bsx.clu_offset);
 	clu_count        = le32_to_cpu(bs->bsx.clu_count);
-	sectors_per_clu  = 1u << bs->bsx.sect_per_clus_bits;
+	sectors_per_clu  = 1ULL << bs->bsx.sect_per_clus_bits;
+
+	if (fat_offset_sect >= clu_offset_sect) {
+		exfat_err("malformed boot sector: FAT offset (%u) >= cluster heap offset (%u)\n",
+			  fat_offset_sect, clu_offset_sect);
+		ret = -EINVAL;
+		goto free_bs;
+	}
 
 	/*
 	 * The FAT can expand into the gap between its current end and the
@@ -672,6 +686,13 @@ int main(int argc, char *argv[])
 		ret = -EINVAL;
 		goto free_bs;
 	}
+	if (bitmap_size_bytes >
+	    (unsigned long long)(clu_count + 7) / 8 + cluster_size - 1) {
+		exfat_err("bitmap dentry size %llu is unreasonably large\n",
+			  bitmap_size_bytes);
+		ret = -EINVAL;
+		goto free_bs;
+	}
 
 	bitmap = malloc(bitmap_size_bytes);
 	if (!bitmap) {
@@ -683,6 +704,13 @@ int main(int argc, char *argv[])
 	bitmap_off = (off_t)clu_offset_sect * sector_size +
 		     (off_t)(bm_start_clu - EXFAT_FIRST_CLUSTER) *
 		     cluster_size;
+
+	if (bitmap_size_bytes > (unsigned long long)SSIZE_MAX) {
+		exfat_err("bitmap size %llu exceeds SSIZE_MAX\n",
+			  bitmap_size_bytes);
+		ret = -EINVAL;
+		goto free_bitmap;
+	}
 
 	if (pread(bd.dev_fd, bitmap, bitmap_size_bytes, bitmap_off) !=
 	    (ssize_t)bitmap_size_bytes) {
