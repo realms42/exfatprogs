@@ -441,6 +441,191 @@ static int do_grow(int fd, const struct pbr *bs, const char *dev_name,
 	return run_fsck(dev_name);
 }
 
+/*
+ * Execute the shrink operation.  The block device is NOT truncated here;
+ * callers are responsible for truncating the underlying file/device afterward.
+ *
+ * Write order is crash-safe: stale data is neutralised before the metadata
+ * fields that constrain it are shrunk, so a crash mid-way still leaves the
+ * old geometry valid rather than pointing at uninitialised content.
+ *
+ *  1. Zero-fill trailing FAT entries      (mark clusters beyond new boundary free)
+ *  2. Zero-fill trailing bitmap bytes     (clear stale allocated bits)
+ *  3. Update bitmap dentry DataLength
+ *  4. Update fat_length + vol_length + clu_count in both boot sectors
+ *  5. Recompute boot checksums
+ *  6. fsync
+ *  7. fsck.exfat -n
+ */
+static int do_shrink(int fd, const struct pbr *bs, const char *dev_name,
+		     unsigned long long new_vol_sectors,
+		     unsigned long long new_clu_count)
+{
+	unsigned int sector_size     = EXFAT_SECTOR_SIZE(bs);
+	unsigned int cluster_size    = EXFAT_CLUSTER_SIZE(bs);
+	unsigned int fat_offset_sect = le32_to_cpu(bs->bsx.fat_offset);
+	unsigned int clu_offset_sect = le32_to_cpu(bs->bsx.clu_offset);
+	unsigned int clu_count       = le32_to_cpu(bs->bsx.clu_count);
+	clus_t bm_start_clu;
+	unsigned long long old_bm_bytes, new_bm_bytes;
+	unsigned int new_fat_length_sect;
+	off_t bitmap_off, dentry_off;
+	struct exfat_dentry de;
+	void *boot_buf;
+	struct pbr *bs_write;
+	int ret;
+
+	ret = find_bitmap_dentry(fd, bs, &bm_start_clu, &old_bm_bytes,
+				 &dentry_off);
+	if (ret)
+		return ret;
+
+	if (bm_start_clu < EXFAT_FIRST_CLUSTER) {
+		exfat_err("invalid bitmap start cluster %u\n", bm_start_clu);
+		return -EINVAL;
+	}
+
+	new_bm_bytes = ((unsigned long long)new_clu_count + 7) / 8;
+
+	new_fat_length_sect = (unsigned int)(
+		((unsigned long long)(new_clu_count + EXFAT_RESERVED_CLUSTERS)
+		 * sizeof(__le32) + sector_size - 1) / sector_size);
+
+	bitmap_off = (off_t)clu_offset_sect * sector_size +
+		     (off_t)(bm_start_clu - EXFAT_FIRST_CLUSTER) * cluster_size;
+
+	/* Step 1 ── zero-fill FAT entries for clusters beyond the new boundary */
+	{
+		off_t fat_trim_off = (off_t)fat_offset_sect * sector_size +
+			(off_t)(new_clu_count + EXFAT_RESERVED_CLUSTERS) *
+			sizeof(__le32);
+		size_t fat_trim_bytes =
+			(size_t)(clu_count - (unsigned int)new_clu_count) *
+			sizeof(__le32);
+
+		if (fat_trim_bytes) {
+			ret = exfat_write_zero(fd, fat_trim_bytes, fat_trim_off);
+			if (ret) {
+				exfat_err("failed to zero-trim FAT: %s\n",
+					  strerror(-ret));
+				return ret;
+			}
+			exfat_debug("FAT trimmed: entries %llu..%u zeroed\n",
+				    new_clu_count + EXFAT_RESERVED_CLUSTERS,
+				    clu_count + EXFAT_RESERVED_CLUSTERS - 1);
+		}
+	}
+
+	/*
+	 * Step 2 ── clear bits beyond new_clu_count in the last partial bitmap
+	 * byte, then zero-fill the now-unused trailing bitmap bytes.
+	 */
+	{
+		unsigned int partial_bits = (unsigned int)(new_clu_count % 8);
+
+		if (partial_bits) {
+			unsigned char b;
+			off_t last_off = bitmap_off + (off_t)(new_bm_bytes - 1);
+
+			if (pread(fd, &b, 1, last_off) != 1) {
+				exfat_err("failed to read last bitmap byte\n");
+				return -EIO;
+			}
+			b &= (unsigned char)((1u << partial_bits) - 1);
+			if (pwrite(fd, &b, 1, last_off) != 1) {
+				exfat_err("failed to write last bitmap byte\n");
+				return -EIO;
+			}
+		}
+
+		if (old_bm_bytes > new_bm_bytes) {
+			ret = exfat_write_zero(fd,
+					       (size_t)(old_bm_bytes - new_bm_bytes),
+					       bitmap_off + (off_t)new_bm_bytes);
+			if (ret) {
+				exfat_err("failed to zero-trim bitmap: %s\n",
+					  strerror(-ret));
+				return ret;
+			}
+			exfat_debug("bitmap trimmed: %llu -> %llu bytes\n",
+				    old_bm_bytes, new_bm_bytes);
+		}
+	}
+
+	/* Step 3 ── update bitmap dentry DataLength */
+	if (pread(fd, &de, sizeof(de), dentry_off) != (ssize_t)sizeof(de)) {
+		exfat_err("failed to re-read bitmap dentry\n");
+		return -EIO;
+	}
+	de.bitmap_size = cpu_to_le64(new_bm_bytes);
+	if (pwrite(fd, &de, sizeof(de), dentry_off) != (ssize_t)sizeof(de)) {
+		exfat_err("failed to write updated bitmap dentry\n");
+		return -EIO;
+	}
+	exfat_debug("bitmap dentry DataLength: %llu -> %llu bytes\n",
+		    old_bm_bytes, new_bm_bytes);
+
+	/*
+	 * Step 4 ── update fat_length, vol_length, clu_count in both boot
+	 * sectors.  Read the full sector to avoid clobbering boot_code.
+	 */
+	boot_buf = malloc(sector_size);
+	if (!boot_buf)
+		return -ENOMEM;
+
+	if (pread(fd, boot_buf, sector_size, 0) != (ssize_t)sector_size) {
+		exfat_err("failed to read main boot sector\n");
+		free(boot_buf);
+		return -EIO;
+	}
+	bs_write = (struct pbr *)boot_buf;
+	bs_write->bsx.fat_length  = cpu_to_le32(new_fat_length_sect);
+	bs_write->bsx.vol_length  = cpu_to_le64(new_vol_sectors);
+	bs_write->bsx.clu_count   = cpu_to_le32((unsigned int)new_clu_count);
+	bs_write->bsx.perc_in_use = 0xFF;
+
+	if (pwrite(fd, boot_buf, sector_size, 0) != (ssize_t)sector_size) {
+		exfat_err("failed to write main boot sector\n");
+		free(boot_buf);
+		return -EIO;
+	}
+	if (pwrite(fd, boot_buf, sector_size,
+		   (off_t)BACKUP_BOOT_SEC_IDX * sector_size) !=
+	    (ssize_t)sector_size) {
+		exfat_err("failed to write backup boot sector\n");
+		free(boot_buf);
+		return -EIO;
+	}
+	free(boot_buf);
+
+	exfat_debug("boot sectors: fat_length=%u vol_length=%llu clu_count=%llu\n",
+		    new_fat_length_sect, new_vol_sectors, new_clu_count);
+
+	/* Step 5 ── recompute boot checksums */
+	ret = recompute_boot_checksum(fd, sector_size, false);
+	if (ret) {
+		exfat_err("failed to update main boot checksum\n");
+		return ret;
+	}
+	ret = recompute_boot_checksum(fd, sector_size, true);
+	if (ret) {
+		exfat_err("failed to update backup boot checksum\n");
+		return ret;
+	}
+
+	/* Step 6 ── flush */
+	if (fsync(fd)) {
+		exfat_err("fsync: %s\n", strerror(errno));
+		return -errno;
+	}
+
+	exfat_info("Shrink complete: %u -> %llu clusters.\n",
+		   clu_count, new_clu_count);
+
+	/* Step 7 ── read-only verification */
+	return run_fsck(dev_name);
+}
+
 int main(int argc, char *argv[])
 {
 	int c;
@@ -740,6 +925,30 @@ int main(int argc, char *argv[])
 		print_bytes(freed);
 		printf(").\n");
 		ret = EXIT_SUCCESS;
+
+		if (!dry_run) {
+			free(bitmap);
+			bitmap = NULL;
+			free(bs);
+			bs = NULL;
+			close(bd.dev_fd);
+			memset(&bd, 0, sizeof(bd));
+
+			ui.writeable = true;
+			ret = exfat_get_blk_dev_info(&ui, &bd);
+			if (ret < 0)
+				goto out;
+
+			ret = read_boot_sect(&bd, &bs);
+			if (ret) {
+				exfat_err("failed to re-read boot sector (rw)\n");
+				goto close;
+			}
+
+			ret = do_shrink(bd.dev_fd, bs, ui.dev_name,
+					new_vol_sectors, new_clu_count);
+			goto free_bitmap;
+		}
 	} else {
 		clus_t new_last =
 			EXFAT_FIRST_CLUSTER + (clus_t)new_clu_count - 1;
