@@ -32,6 +32,7 @@ AC_CONFIG_FILES([
 	label/Makefile
 	dump/Makefile
 	exfat2img/Makefile
+	resize/Makefile
 ])
 
 AC_OUTPUT
