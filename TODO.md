@@ -1,43 +1,82 @@
 # TODO — resize/shrink feature known gaps
 
-## Correctness Bugs (high priority)
+All ten original items have been addressed on this branch.  Two have
+remaining work noted below.
 
-### 1. FAT2 not updated
-exFAT supports two FATs (`num_fats` in the boot sector). The relocation code only writes FAT 0. If `bs->bsx.num_fats == 2`, FAT 1 (at `fat_offset + fat_length` sectors) must be kept in sync.
+## Completed
 
-### 2. Contiguous multi-cluster directory scan
-If a subdirectory has `EXFAT_SF_CONTIGUOUS` set and spans more than one cluster, `scan_directory` stops after the first cluster (because `fat[dir_clu]` is 0). Files in the second+ cluster of such a directory are invisible to the relocation pass and will be silently truncated by `do_shrink`.
+### 1. FAT2 sync ✓
+`write_fat()` now mirrors every write to FAT 1 when `num_fats == 2`.
+The zero-fill passes in `do_grow` and `do_shrink` are likewise duplicated
+to the second FAT region.
 
-### 3. Multi-cluster metadata guard
-The metadata guard only checks the start cluster of the upcase table and bitmap. If either chain spans multiple clusters and a later cluster lies beyond the new boundary, `do_shrink` silently corrupts the volume. The full FAT chain of each metadata object must be walked before any writes.
+### 2. Contiguous multi-cluster directory scan ✓
+`scan_directory()` now accepts `dir_is_contiguous` / `dir_size` and
+advances through clusters arithmetically instead of via FAT when the
+directory has `EXFAT_SF_CONTIGUOUS` set.  Recursive calls pass the
+subdir's own contiguousness flags.
 
-### 4. No truncation of the image file
-After `do_shrink` completes the image file retains its original size. For a block device the partition boundary enforces the limit, but for a regular file the trailing bytes are wasted. A `ftruncate(fd, new_vol_sectors * sector_size)` after `fsync` is the right close.
+### 3. Multi-cluster metadata guard ✓
+`check_chain_in_bounds()` walks the full FAT chain of the allocation
+bitmap, upcase table, and root directory before any write is permitted.
+Previously only start clusters were checked.
 
-### 5. No validation that new_clu_count doesn't cut through a chain
-The code refuses if the highest cluster is beyond the boundary but does not verify that every cluster in a chain is either entirely inside or entirely outside. A corrupted FS could have a chain straddling the boundary in a non-contiguous way. A pre-flight check would make the tool more defensive.
+### 4. Image file truncation after shrink ✓
+`do_shrink` calls `ftruncate(fd, new_vol_sectors * sector_size)` after
+`fsync` for regular files.  Block devices are unaffected.
 
-## Quality / Robustness
+### 5. Pre-flight chain validation ✓
+After Phase 0.5 (FAT normalisation), every file chain is walked with a
+step counter capped at `clu_count` (cycle detection) and a per-cluster
+seen-bitmap (cross-link detection).  Either condition produces a clear
+error before any data is moved.
 
-### 6. PercentInUse not recomputed after relocation
-Both `do_grow` and `do_shrink` set `perc_in_use = 0xFF` (unknown). After relocation the exact count is known and the correct value could be written.
+### 6. PercentInUse recomputed ✓
+`count_used_clusters()` reads the already-updated bitmap and counts set
+bits.  `do_grow` and `do_shrink` now write the accurate percentage to
+both boot sectors instead of the `0xFF` sentinel.
 
-### 7. No progress reporting for large relocations
-Moving thousands of clusters with no output looks like a hang. A simple `exfat_info("Relocating cluster %u/%u...\r", i+1, ml.count)` would help.
+### 7. Progress reporting for large relocations ✓
+Phase 3 emits `relocating cluster N/M\r` via `exfat_info` so large
+relocations show live progress instead of appearing to hang.
 
-### 8. Predecessor linear scan is O(n²)
-Finding the relocated predecessor in Phase 3 does a linear scan over the move list for every entry. For volumes with many out-of-range clusters this is slow. A hash map or sorting by `old_clu` would make it O(n log n).
+### 8. Predecessor lookup O(n log n) ✓
+A sorted `(old→new)` `reloc_map` is built from the move list after
+Phase 2.  `bsearch()` replaces the former O(n) linear scan per cluster.
 
-### 9. No --force flag for metadata-beyond-boundary
-Currently a hard refusal. Some advanced users might want to relocate metadata (bitmap can be moved; upcase can be rebuilt). A future `--force` flag could handle this.
+### 9. `--force` flag — **partially done**
+The flag exists and is wired up (`-f` / `--force`).  When a metadata
+chain extends beyond the new boundary the tool now warns instead of
+hard-refusing and proceeds with user-data relocation.
 
-### 10. No automated test coverage
-There are no automated tests (`make check` or shell test suite). A `tests/` directory with scripts covering at minimum: dry-run block, relocate+shrink, empty shrink, and grow round-trip would prevent regressions.
+**Remaining:** `--force` does not actually *relocate* metadata chains.
+If a bitmap, upcase-table, or root-directory cluster lies beyond the
+boundary it will be silently truncated by the subsequent `do_shrink`.
+The full implementation requires:
+- Walking and relocating the bitmap chain (then flushing the in-memory
+  working copy to the new cluster location).
+- Walking and relocating the upcase table chain; updating the upcase
+  dentry `start_clu` if the head moves.
+- Walking and relocating the root-directory chain; updating
+  `bs->bsx.root_cluster` in both boot sectors if the head moves.
 
-## Priority Order
+Until this is done `--force` is suitable only when the user intends to
+run `fsck.exfat -y` immediately afterward to repair the truncated
+metadata.
 
-1. **FAT2 sync** — correctness bug, easy fix
-2. **ftruncate after shrink** — correctness for image files, two lines
-3. **Contiguous multi-cluster directory scan** — correctness, moderate effort *(in progress on this branch)*
-4. **Automated test script** — safety net for all future work
-5. **Multi-cluster metadata guard** — correctness, low effort
+### 10. Automated test coverage — **partially done**
+`tests/test_resize.sh` exists and covers six scenarios:
+- dry-run no-write guarantee
+- empty shrink with `ftruncate` verification
+- grow
+- grow + shrink round-trip
+- dry-run-blocked detection
+- relocate-then-shrink with fsck verification
+
+**Remaining:**
+- No `make check` / `Makefile.am` integration; tests must be run by hand
+  with explicit `MKFS=`, `RESIZE=`, `FSCK=` variables.
+- No test coverage for FAT2 dual-write (requires a two-FAT image).
+- No test coverage for contiguous multi-cluster directory scan.
+- No test coverage for `--force` bypass (needs a crafted image where
+  metadata chains extend beyond the boundary).
