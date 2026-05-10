@@ -626,6 +626,704 @@ static int do_shrink(int fd, const struct pbr *bs, const char *dev_name,
 	return run_fsck(dev_name);
 }
 
+/* ══════════════════════════════════════════════════════════════
+ * Cluster relocation — moves allocated clusters that lie at or
+ * beyond the new shrink boundary into free space below it.
+ * ══════════════════════════════════════════════════════════════ */
+
+#define MAX_DIR_DEPTH	64
+
+struct chain_entry {
+	clus_t		head;
+	off_t		stream_off;	  /* on-disk offset of STREAM dentry */
+	clus_t		dir_clu;	  /* start cluster of containing dir */
+	unsigned int	file_dentry_idx;  /* linear index of FILE dentry in dir */
+	int		num_ext;	  /* file_num_ext from FILE dentry */
+	bool		is_contiguous;
+	unsigned long long chain_size;	  /* stream_size (for contiguous chains) */
+};
+
+struct chain_map {
+	struct chain_entry *entries;
+	unsigned int	    count;
+	unsigned int	    cap;
+};
+
+struct move_entry {
+	clus_t		old_clu;
+	clus_t		new_clu;	/* filled in Phase 2 */
+	bool		is_head;
+	clus_t		pred_clu;	/* predecessor (when !is_head) */
+	off_t		stream_off;
+	clus_t		dir_clu;
+	unsigned int	file_dentry_idx;
+	int		num_ext;
+};
+
+struct move_list {
+	struct move_entry *entries;
+	unsigned int	   count;
+	unsigned int	   cap;
+};
+
+/* ── FAT helpers ──────────────────────────────────────────── */
+
+static off_t fat_off(unsigned int fat_offset_sect, unsigned int sector_size,
+		     clus_t clu)
+{
+	return (off_t)fat_offset_sect * sector_size +
+	       (off_t)clu * sizeof(__le32);
+}
+
+static int read_fat(int fd, unsigned int fat_offset_sect,
+		    unsigned int sector_size, clus_t clu, clus_t *next)
+{
+	__le32 v;
+
+	if (pread(fd, &v, sizeof(v), fat_off(fat_offset_sect, sector_size, clu))
+	    != sizeof(v))
+		return -EIO;
+	*next = le32_to_cpu(v);
+	return 0;
+}
+
+static int write_fat(int fd, unsigned int fat_offset_sect,
+		     unsigned int sector_size, clus_t clu, clus_t next)
+{
+	__le32 v = cpu_to_le32(next);
+
+	if (pwrite(fd, &v, sizeof(v), fat_off(fat_offset_sect, sector_size, clu))
+	    != sizeof(v))
+		return -EIO;
+	return 0;
+}
+
+/* ── Bitmap helper ────────────────────────────────────────── */
+
+static int bitmap_update_bit(int fd, off_t bm_off, clus_t clu, bool set)
+{
+	unsigned int bit_idx = clu - EXFAT_FIRST_CLUSTER;
+	off_t byte_off = bm_off + (off_t)(bit_idx / 8);
+	unsigned char mask = (unsigned char)(1u << (bit_idx % 8));
+	unsigned char b;
+
+	if (pread(fd, &b, 1, byte_off) != 1)
+		return -EIO;
+	if (set)
+		b |= mask;
+	else
+		b &= ~mask;
+	if (pwrite(fd, &b, 1, byte_off) != 1)
+		return -EIO;
+	return 0;
+}
+
+/* ── Directory dentry offset by linear index ──────────────── */
+
+static int get_dir_dentry_off(int fd, clus_t dir_clu, unsigned int idx,
+			      unsigned int cluster_size,
+			      unsigned int sector_size,
+			      unsigned int fat_offset_sect,
+			      unsigned int clu_offset_sect,
+			      off_t *out)
+{
+	unsigned int dpc = cluster_size / sizeof(struct exfat_dentry);
+	unsigned int steps = idx / dpc;
+	clus_t clu = dir_clu;
+	unsigned int i;
+
+	for (i = 0; i < steps; i++) {
+		__le32 v;
+		off_t foff = (off_t)fat_offset_sect * sector_size +
+			     (off_t)clu * sizeof(__le32);
+
+		if (pread(fd, &v, sizeof(v), foff) != sizeof(v))
+			return -EIO;
+		clu = le32_to_cpu(v);
+		if (clu < EXFAT_FIRST_CLUSTER || clu == EXFAT_EOF_CLUSTER)
+			return -EINVAL;
+	}
+
+	*out = (off_t)clu_offset_sect * sector_size +
+	       (off_t)(clu - EXFAT_FIRST_CLUSTER) * cluster_size +
+	       (off_t)(idx % dpc) * sizeof(struct exfat_dentry);
+	return 0;
+}
+
+/* ── Dentry-set checksum (same algorithm as exfat_calc_dentry_checksum) ── */
+
+static void reloc_checksum_dentry(const struct exfat_dentry *de,
+				  uint16_t *checksum, bool primary)
+{
+	unsigned int i;
+	const uint8_t *b = (const uint8_t *)de;
+
+	*checksum = (*checksum << 15) | (*checksum >> 1);
+	*checksum += b[0];
+	*checksum = (*checksum << 15) | (*checksum >> 1);
+	*checksum += b[1];
+
+	for (i = primary ? 4u : 2u; i < sizeof(*de); i++) {
+		*checksum = (*checksum << 15) | (*checksum >> 1);
+		*checksum += b[i];
+	}
+}
+
+/*
+ * Read the full dentry set for a chain_entry, compute the EntrySetChecksum,
+ * and write the updated FILE dentry back to disk.
+ */
+static int update_file_checksum(int fd, clus_t dir_clu,
+				unsigned int file_dentry_idx, int num_ext,
+				unsigned int cluster_size,
+				unsigned int sector_size,
+				unsigned int fat_offset_sect,
+				unsigned int clu_offset_sect)
+{
+	int total = num_ext + 1;
+	struct exfat_dentry *dset;
+	uint16_t checksum;
+	off_t file_off;
+	int i, ret = 0;
+
+	dset = malloc((size_t)total * sizeof(*dset));
+	if (!dset)
+		return -ENOMEM;
+
+	for (i = 0; i < total; i++) {
+		off_t off;
+
+		ret = get_dir_dentry_off(fd, dir_clu, file_dentry_idx + i,
+					 cluster_size, sector_size,
+					 fat_offset_sect, clu_offset_sect, &off);
+		if (ret)
+			goto out;
+		if (pread(fd, &dset[i], sizeof(*dset), off) !=
+		    (ssize_t)sizeof(*dset)) {
+			ret = -EIO;
+			goto out;
+		}
+	}
+
+	checksum = 0;
+	reloc_checksum_dentry(&dset[0], &checksum, true);
+	for (i = 1; i < total; i++)
+		reloc_checksum_dentry(&dset[i], &checksum, false);
+
+	ret = get_dir_dentry_off(fd, dir_clu, file_dentry_idx,
+				 cluster_size, sector_size,
+				 fat_offset_sect, clu_offset_sect, &file_off);
+	if (ret)
+		goto out;
+
+	dset[0].file_checksum = cpu_to_le16(checksum);
+	if (pwrite(fd, &dset[0], sizeof(dset[0]), file_off) !=
+	    (ssize_t)sizeof(dset[0]))
+		ret = -EIO;
+
+out:
+	free(dset);
+	return ret;
+}
+
+/* ── Dynamic-array helpers ────────────────────────────────── */
+
+static int chain_map_add(struct chain_map *cm, const struct chain_entry *ce)
+{
+	if (cm->count == cm->cap) {
+		unsigned int new_cap = cm->cap ? cm->cap * 2 : 64;
+		struct chain_entry *tmp;
+
+		tmp = realloc(cm->entries, new_cap * sizeof(*tmp));
+		if (!tmp)
+			return -ENOMEM;
+		cm->entries = tmp;
+		cm->cap = new_cap;
+	}
+	cm->entries[cm->count++] = *ce;
+	return 0;
+}
+
+static int move_list_add(struct move_list *ml, clus_t old_clu,
+			 bool is_head, clus_t pred_clu,
+			 const struct chain_entry *ce)
+{
+	struct move_entry *me;
+
+	if (ml->count == ml->cap) {
+		unsigned int new_cap = ml->cap ? ml->cap * 2 : 64;
+		struct move_entry *tmp;
+
+		tmp = realloc(ml->entries, new_cap * sizeof(*tmp));
+		if (!tmp)
+			return -ENOMEM;
+		ml->entries = tmp;
+		ml->cap = new_cap;
+	}
+	me = &ml->entries[ml->count++];
+	me->old_clu       = old_clu;
+	me->new_clu       = EXFAT_FREE_CLUSTER;
+	me->is_head       = is_head;
+	me->pred_clu      = pred_clu;
+	me->stream_off    = ce->stream_off;
+	me->dir_clu       = ce->dir_clu;
+	me->file_dentry_idx = ce->file_dentry_idx;
+	me->num_ext       = ce->num_ext;
+	return 0;
+}
+
+/* ── Phase 0: scan directory tree ─────────────────────────── */
+
+static int scan_directory(int fd, unsigned int sector_size,
+			  unsigned int cluster_size,
+			  unsigned int fat_offset_sect,
+			  unsigned int clu_offset_sect,
+			  clus_t dir_clu, struct chain_map *cm, int depth)
+{
+	int dpc = (int)(cluster_size / sizeof(struct exfat_dentry));
+	clus_t clu = dir_clu;
+	unsigned int linear_idx = 0;
+	int sec_remain = 0;
+	int saved_num_ext = 0;
+	unsigned int saved_file_idx = 0;
+	bool is_subdir = false, got_stream = false;
+
+	if (depth > MAX_DIR_DEPTH) {
+		exfat_err("directory recursion depth limit exceeded\n");
+		return -EINVAL;
+	}
+
+	while (clu >= EXFAT_FIRST_CLUSTER && clu != EXFAT_EOF_CLUSTER) {
+		off_t clu_off = (off_t)clu_offset_sect * sector_size +
+				(off_t)(clu - EXFAT_FIRST_CLUSTER) * cluster_size;
+		int i;
+
+		for (i = 0; i < dpc; i++, linear_idx++) {
+			struct exfat_dentry de;
+			off_t de_off = clu_off + (off_t)i * sizeof(de);
+
+			if (pread(fd, &de, sizeof(de), de_off) !=
+			    (ssize_t)sizeof(de))
+				return -EIO;
+
+			if (de.type == EXFAT_LAST)
+				return 0;
+
+			if (sec_remain > 0) {
+				sec_remain--;
+				if (!got_stream &&
+				    de.type == EXFAT_STREAM) {
+					clus_t head =
+						le32_to_cpu(de.stream_start_clu);
+
+					got_stream = true;
+					if (head >= EXFAT_FIRST_CLUSTER) {
+						struct chain_entry ce = {
+							.head = head,
+							.stream_off = de_off,
+							.dir_clu = dir_clu,
+							.file_dentry_idx = saved_file_idx,
+							.num_ext = saved_num_ext,
+							.is_contiguous = !!(de.stream_flags & EXFAT_SF_CONTIGUOUS),
+							.chain_size = le64_to_cpu(de.stream_size),
+						};
+						int ret = chain_map_add(cm, &ce);
+
+						if (ret)
+							return ret;
+						if (is_subdir) {
+							ret = scan_directory(
+								fd, sector_size,
+								cluster_size,
+								fat_offset_sect,
+								clu_offset_sect,
+								head, cm,
+								depth + 1);
+							if (ret)
+								return ret;
+						}
+					}
+				}
+				continue;
+			}
+
+			/* primary dentry */
+			got_stream = false;
+			is_subdir = false;
+
+			if (de.type != EXFAT_FILE)
+				continue;
+
+			saved_file_idx = linear_idx;
+			saved_num_ext  = de.file_num_ext;
+			sec_remain     = de.file_num_ext;
+			is_subdir      = !!(le16_to_cpu(de.file_attr) &
+					    ATTR_SUBDIR);
+		}
+
+		/* advance to next cluster via FAT */
+		{
+			clus_t next;
+			int ret = read_fat(fd, fat_offset_sect, sector_size,
+					   clu, &next);
+
+			if (ret)
+				return ret;
+			clu = next;
+		}
+	}
+	return 0;
+}
+
+/* ── Phase 0.5: write FAT entries and clear NoFatChain flag ── */
+
+static int normalize_contiguous_chain(int fd,
+				      const struct chain_entry *ce,
+				      unsigned int sector_size,
+				      unsigned int cluster_size,
+				      unsigned int fat_offset_sect,
+				      unsigned int clu_offset_sect)
+{
+	unsigned long long num_clus;
+	struct exfat_dentry sde;
+	clus_t c;
+	unsigned long long k;
+	int ret;
+
+	if (!ce->is_contiguous)
+		return 0;
+
+	num_clus = ce->chain_size
+		   ? (ce->chain_size + cluster_size - 1) / cluster_size
+		   : 0;
+	if (num_clus == 0)
+		return 0;
+
+	/* Write sequential FAT entries */
+	for (k = 0; k + 1 < num_clus; k++) {
+		c = ce->head + (clus_t)k;
+		ret = write_fat(fd, fat_offset_sect, sector_size, c, c + 1);
+		if (ret)
+			return ret;
+	}
+	c = ce->head + (clus_t)(num_clus - 1);
+	ret = write_fat(fd, fat_offset_sect, sector_size, c,
+			EXFAT_EOF_CLUSTER);
+	if (ret)
+		return ret;
+
+	/* Clear NoFatChain flag in STREAM dentry */
+	if (pread(fd, &sde, sizeof(sde), ce->stream_off) !=
+	    (ssize_t)sizeof(sde))
+		return -EIO;
+	sde.stream_flags &= (uint8_t)~EXFAT_SF_CONTIGUOUS;
+	if (pwrite(fd, &sde, sizeof(sde), ce->stream_off) !=
+	    (ssize_t)sizeof(sde))
+		return -EIO;
+
+	/* Recompute FILE dentry checksum */
+	return update_file_checksum(fd, ce->dir_clu, ce->file_dentry_idx,
+				    ce->num_ext, cluster_size, sector_size,
+				    fat_offset_sect, clu_offset_sect);
+}
+
+/* ── Helper: find upcase table start cluster ──────────────── */
+
+static int find_upcase_start_clu(int fd, const struct pbr *bs,
+				 clus_t *start_clu)
+{
+	unsigned int sector_size  = EXFAT_SECTOR_SIZE(bs);
+	unsigned int cluster_size = EXFAT_CLUSTER_SIZE(bs);
+	unsigned int clu_offset_sect = le32_to_cpu(bs->bsx.clu_offset);
+	clus_t root_clu = le32_to_cpu(bs->bsx.root_cluster);
+	int max_de = (int)(cluster_size / sizeof(struct exfat_dentry));
+	off_t root_off = (off_t)clu_offset_sect * sector_size +
+			 (off_t)(root_clu - EXFAT_FIRST_CLUSTER) * cluster_size;
+	int i;
+
+	for (i = 0; i < max_de; i++) {
+		struct exfat_dentry de;
+		off_t de_off = root_off + (off_t)i * sizeof(de);
+
+		if (pread(fd, &de, sizeof(de), de_off) != (ssize_t)sizeof(de))
+			return -EIO;
+		if (de.type == EXFAT_LAST)
+			break;
+		if (de.type == EXFAT_UPCASE) {
+			*start_clu = le32_to_cpu(de.upcase_start_clu);
+			return 0;
+		}
+	}
+	exfat_err("upcase table dentry not found in root directory\n");
+	return -EINVAL;
+}
+
+/*
+ * try_relocate — move every allocated cluster at or beyond new_clu_count
+ * into free space below it, update FAT / dentries / bitmap, then fsync.
+ *
+ * Returns 0 on success; prints its own diagnostic and returns <0 on failure.
+ * The caller must have opened fd read-write.
+ */
+static int try_relocate(int fd, const struct pbr *bs,
+			clus_t new_clu_count)
+{
+	unsigned int sector_size     = EXFAT_SECTOR_SIZE(bs);
+	unsigned int cluster_size    = EXFAT_CLUSTER_SIZE(bs);
+	unsigned int fat_offset_sect = le32_to_cpu(bs->bsx.fat_offset);
+	unsigned int clu_offset_sect = le32_to_cpu(bs->bsx.clu_offset);
+	clus_t root_clu  = le32_to_cpu(bs->bsx.root_cluster);
+	clus_t boundary  = new_clu_count + EXFAT_FIRST_CLUSTER;
+
+	clus_t bm_start_clu, uc_start_clu;
+	unsigned long long bm_bytes;
+	off_t bm_off;
+
+	struct chain_map cm = {0};
+	struct move_list ml = {0};
+	unsigned char *bmap = NULL;
+	void *data_buf = NULL;
+	unsigned int i;
+	int ret;
+
+	/* ── Locate allocation bitmap ── */
+	ret = find_bitmap_dentry(fd, bs, &bm_start_clu, &bm_bytes, NULL);
+	if (ret)
+		return ret;
+
+	/* ── Find upcase start cluster ── */
+	ret = find_upcase_start_clu(fd, bs, &uc_start_clu);
+	if (ret)
+		return ret;
+
+	/* ── Guard: refuse if any metadata is itself beyond boundary ── */
+	if (bm_start_clu >= boundary || uc_start_clu >= boundary ||
+	    root_clu >= boundary) {
+		exfat_err("SHRINK BLOCKED — metadata beyond new boundary\n");
+		return -EINVAL;
+	}
+
+	bm_off = (off_t)clu_offset_sect * sector_size +
+		 (off_t)(bm_start_clu - EXFAT_FIRST_CLUSTER) * cluster_size;
+
+	/* ── Read allocation bitmap into a working copy ── */
+	bmap = malloc(bm_bytes);
+	if (!bmap) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	if (pread(fd, bmap, bm_bytes, bm_off) != (ssize_t)bm_bytes) {
+		ret = -EIO;
+		goto free_bmap;
+	}
+
+	/* ── Phase 0: build chain map from directory tree ── */
+	ret = scan_directory(fd, sector_size, cluster_size,
+			     fat_offset_sect, clu_offset_sect,
+			     root_clu, &cm, 0);
+	if (ret)
+		goto free_bmap;
+
+	/*
+	 * ── Phase 0.5: normalise contiguous chains ──
+	 * Write sequential FAT entries for chains with NoFatChain set so that
+	 * Phase 1 can walk every chain uniformly via the FAT.
+	 */
+	for (i = 0; i < cm.count; i++) {
+		if (!cm.entries[i].is_contiguous)
+			continue;
+		ret = normalize_contiguous_chain(fd, &cm.entries[i],
+						 sector_size, cluster_size,
+						 fat_offset_sect,
+						 clu_offset_sect);
+		if (ret)
+			goto free_bmap;
+	}
+
+	/* ── Phase 1: build move list ── */
+	for (i = 0; i < cm.count; i++) {
+		struct chain_entry *ce = &cm.entries[i];
+		clus_t clu  = ce->head;
+		clus_t prev = EXFAT_FREE_CLUSTER;
+		bool is_head = true;
+
+		while (clu >= EXFAT_FIRST_CLUSTER &&
+		       clu != EXFAT_EOF_CLUSTER) {
+			if (clu >= boundary) {
+				ret = move_list_add(&ml, clu, is_head,
+						    prev, ce);
+				if (ret)
+					goto free_ml;
+			}
+
+			{
+				clus_t next;
+
+				ret = read_fat(fd, fat_offset_sect,
+					       sector_size, clu, &next);
+				if (ret)
+					goto free_ml;
+				prev = clu;
+				clu  = next;
+			}
+			is_head = false;
+		}
+	}
+
+	if (ml.count == 0) {
+		/* nothing to relocate */
+		ret = 0;
+		goto free_ml;
+	}
+
+	/* ── Phase 2: dry-allocate replacement clusters below boundary ── */
+	{
+		unsigned int alloc_idx = 0;
+		clus_t c;
+
+		for (c = EXFAT_FIRST_CLUSTER;
+		     c < boundary && alloc_idx < ml.count; c++) {
+			unsigned int bit_idx = c - EXFAT_FIRST_CLUSTER;
+
+			if (!(bmap[bit_idx / 8] & (1u << (bit_idx % 8)))) {
+				ml.entries[alloc_idx].new_clu = c;
+				bmap[bit_idx / 8] |=
+					(unsigned char)(1u << (bit_idx % 8));
+				alloc_idx++;
+			}
+		}
+
+		if (alloc_idx < ml.count) {
+			exfat_err("SHRINK BLOCKED — insufficient free space "
+				  "below new boundary\n");
+			ret = -ENOSPC;
+			goto free_ml;
+		}
+	}
+
+	/* ── Phase 3: copy data, redirect FAT, update dentries + bitmap ── */
+	data_buf = malloc(cluster_size);
+	if (!data_buf) {
+		ret = -ENOMEM;
+		goto free_ml;
+	}
+
+	for (i = 0; i < ml.count; i++) {
+		struct move_entry *me = &ml.entries[i];
+		clus_t old = me->old_clu;
+		clus_t neu = me->new_clu;
+		off_t old_off = (off_t)clu_offset_sect * sector_size +
+				(off_t)(old - EXFAT_FIRST_CLUSTER) *
+				cluster_size;
+		off_t new_off = (off_t)clu_offset_sect * sector_size +
+				(off_t)(neu - EXFAT_FIRST_CLUSTER) *
+				cluster_size;
+		clus_t succ;
+
+		/* 1. Copy cluster data */
+		if (pread(fd, data_buf, cluster_size, old_off) !=
+		    (ssize_t)cluster_size) {
+			ret = -EIO;
+			goto free_buf;
+		}
+		if (pwrite(fd, data_buf, cluster_size, new_off) !=
+		    (ssize_t)cluster_size) {
+			ret = -EIO;
+			goto free_buf;
+		}
+
+		/* 2. Read old FAT entry (successor) */
+		ret = read_fat(fd, fat_offset_sect, sector_size, old, &succ);
+		if (ret)
+			goto free_buf;
+
+		/* 3. Write fat[new] = successor */
+		ret = write_fat(fd, fat_offset_sect, sector_size, neu, succ);
+		if (ret)
+			goto free_buf;
+
+		/* 4a. Update predecessor */
+		if (me->is_head) {
+			/* Update stream_start_clu in STREAM dentry */
+			struct exfat_dentry sde;
+
+			if (pread(fd, &sde, sizeof(sde), me->stream_off) !=
+			    (ssize_t)sizeof(sde)) {
+				ret = -EIO;
+				goto free_buf;
+			}
+			sde.stream_start_clu = cpu_to_le32(neu);
+			if (pwrite(fd, &sde, sizeof(sde), me->stream_off) !=
+			    (ssize_t)sizeof(sde)) {
+				ret = -EIO;
+				goto free_buf;
+			}
+			/* Recompute FILE dentry checksum */
+			ret = update_file_checksum(fd, me->dir_clu,
+						   me->file_dentry_idx,
+						   me->num_ext, cluster_size,
+						   sector_size, fat_offset_sect,
+						   clu_offset_sect);
+			if (ret)
+				goto free_buf;
+		} else {
+			/*
+			 * Find effective predecessor: if pred_clu itself was
+			 * relocated, point to its new address.
+			 */
+			clus_t eff_pred = me->pred_clu;
+			unsigned int j;
+
+			for (j = 0; j < i; j++) {
+				if (ml.entries[j].old_clu == eff_pred) {
+					eff_pred = ml.entries[j].new_clu;
+					break;
+				}
+			}
+			ret = write_fat(fd, fat_offset_sect, sector_size,
+					eff_pred, neu);
+			if (ret)
+				goto free_buf;
+		}
+
+		/* 4b. Clear old FAT entry */
+		ret = write_fat(fd, fat_offset_sect, sector_size, old,
+				EXFAT_FREE_CLUSTER);
+		if (ret)
+			goto free_buf;
+
+		/* 4c. Update on-disk bitmap */
+		ret = bitmap_update_bit(fd, bm_off, old, false);
+		if (ret)
+			goto free_buf;
+		ret = bitmap_update_bit(fd, bm_off, neu, true);
+		if (ret)
+			goto free_buf;
+
+		exfat_debug("relocated cluster %u -> %u\n", old, neu);
+	}
+
+	exfat_info("Relocated %u cluster(s) below new boundary.\n",
+		   ml.count);
+
+	if (fsync(fd)) {
+		exfat_err("fsync after relocation: %s\n", strerror(errno));
+		ret = -errno;
+		goto free_buf;
+	}
+	ret = 0;
+
+free_buf:
+	free(data_buf);
+free_ml:
+	free(ml.entries);
+free_bmap:
+	free(bmap);
+	free(cm.entries);
+out:
+	return ret;
+}
+
 int main(int argc, char *argv[])
 {
 	int c;
@@ -950,15 +1648,57 @@ int main(int argc, char *argv[])
 			goto free_bitmap;
 		}
 	} else {
-		clus_t new_last =
-			EXFAT_FIRST_CLUSTER + (clus_t)new_clu_count - 1;
+		/*
+		 * Clusters exist beyond the new boundary.  In dry-run mode
+		 * report how many; otherwise relocate them then shrink.
+		 */
+		if (dry_run) {
+			unsigned int n_beyond = 0;
+			clus_t c;
 
-		printf("Result: SHRINK BLOCKED\n"
-		       "  Cluster %u is allocated beyond the new boundary"
-		       " (last valid cluster %u).\n"
-		       "  Free or move data, then retry.\n",
-		       highest, new_last);
-		ret = EXIT_FAILURE;
+			for (c = EXFAT_FIRST_CLUSTER + (clus_t)new_clu_count;
+			     c < EXFAT_FIRST_CLUSTER + clu_count; c++) {
+				unsigned int bit_idx = c - EXFAT_FIRST_CLUSTER;
+
+				if (bitmap[bit_idx / 8] &
+				    (1u << (bit_idx % 8)))
+					n_beyond++;
+			}
+			printf("Result: SHRINK BLOCKED\n"
+			       "  %u cluster(s) beyond new boundary;"
+			       " re-run without -n to relocate.\n",
+			       n_beyond);
+			ret = EXIT_FAILURE;
+		} else {
+			/* Reopen read-write for relocation + shrink */
+			free(bitmap);
+			bitmap = NULL;
+			free(bs);
+			bs = NULL;
+			close(bd.dev_fd);
+			memset(&bd, 0, sizeof(bd));
+
+			ui.writeable = true;
+			ret = exfat_get_blk_dev_info(&ui, &bd);
+			if (ret < 0)
+				goto out;
+
+			ret = read_boot_sect(&bd, &bs);
+			if (ret) {
+				exfat_err("failed to re-read boot sector (rw)\n");
+				goto close;
+			}
+
+			exfat_info("Relocating clusters beyond new boundary...\n");
+			ret = try_relocate(bd.dev_fd, bs,
+					   (clus_t)new_clu_count);
+			if (ret)
+				goto free_bitmap; /* already printed error */
+
+			ret = do_shrink(bd.dev_fd, bs, ui.dev_name,
+					new_vol_sectors, new_clu_count);
+			goto free_bitmap;
+		}
 	}
 
 free_bitmap:
