@@ -13,6 +13,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 #include "exfat_ondisk.h"
@@ -269,6 +270,7 @@ static int do_grow(int fd, const struct pbr *bs, const char *dev_name,
 	unsigned int fat_length_sect = le32_to_cpu(bs->bsx.fat_length);
 	unsigned int clu_offset_sect = le32_to_cpu(bs->bsx.clu_offset);
 	unsigned int clu_count     = le32_to_cpu(bs->bsx.clu_count);
+	unsigned int num_fats      = bs->bsx.num_fats;
 	clus_t bm_start_clu;
 	unsigned long long old_bm_bytes, new_bm_bytes, bm_alloc_bytes;
 	unsigned int new_fat_length_sect;
@@ -346,6 +348,17 @@ static int do_grow(int fd, const struct pbr *bs, const char *dev_name,
 			exfat_err("failed to zero-extend FAT: %s\n",
 				  strerror(-ret));
 			return ret;
+		}
+		if (num_fats == 2) {
+			off_t fat2_end = old_fat_end +
+					 (off_t)fat_length_sect * sector_size;
+
+			ret = exfat_write_zero(fd, new_fat_bytes, fat2_end);
+			if (ret) {
+				exfat_err("failed to zero-extend FAT2: %s\n",
+					  strerror(-ret));
+				return ret;
+			}
 		}
 		exfat_debug("FAT extended: %u -> %u sectors\n",
 			    fat_length_sect, new_fat_length_sect);
@@ -464,8 +477,10 @@ static int do_shrink(int fd, const struct pbr *bs, const char *dev_name,
 	unsigned int sector_size     = EXFAT_SECTOR_SIZE(bs);
 	unsigned int cluster_size    = EXFAT_CLUSTER_SIZE(bs);
 	unsigned int fat_offset_sect = le32_to_cpu(bs->bsx.fat_offset);
+	unsigned int fat_length_sect = le32_to_cpu(bs->bsx.fat_length);
 	unsigned int clu_offset_sect = le32_to_cpu(bs->bsx.clu_offset);
 	unsigned int clu_count       = le32_to_cpu(bs->bsx.clu_count);
+	unsigned int num_fats        = bs->bsx.num_fats;
 	clus_t bm_start_clu;
 	unsigned long long old_bm_bytes, new_bm_bytes;
 	unsigned int new_fat_length_sect;
@@ -509,6 +524,18 @@ static int do_shrink(int fd, const struct pbr *bs, const char *dev_name,
 				exfat_err("failed to zero-trim FAT: %s\n",
 					  strerror(-ret));
 				return ret;
+			}
+			if (num_fats == 2) {
+				off_t fat2_trim_off = fat_trim_off +
+					(off_t)fat_length_sect * sector_size;
+
+				ret = exfat_write_zero(fd, fat_trim_bytes,
+						       fat2_trim_off);
+				if (ret) {
+					exfat_err("failed to zero-trim FAT2: %s\n",
+						  strerror(-ret));
+					return ret;
+				}
 			}
 			exfat_debug("FAT trimmed: entries %llu..%u zeroed\n",
 				    new_clu_count + EXFAT_RESERVED_CLUSTERS,
@@ -619,6 +646,22 @@ static int do_shrink(int fd, const struct pbr *bs, const char *dev_name,
 		return -errno;
 	}
 
+	/* Step 6b ── truncate image file to new size (no-op for block devices) */
+	{
+		struct stat st;
+
+		if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+			off_t new_size = (off_t)new_vol_sectors * sector_size;
+
+			if (ftruncate(fd, new_size))
+				exfat_err("ftruncate: %s (non-fatal)\n",
+					  strerror(errno));
+			else
+				exfat_debug("image truncated to %llu bytes\n",
+					    (unsigned long long)new_size);
+		}
+	}
+
 	exfat_info("Shrink complete: %u -> %llu clusters.\n",
 		   clu_count, new_clu_count);
 
@@ -688,13 +731,22 @@ static int read_fat(int fd, unsigned int fat_offset_sect,
 }
 
 static int write_fat(int fd, unsigned int fat_offset_sect,
-		     unsigned int sector_size, clus_t clu, clus_t next)
+		     unsigned int fat_length_sect,
+		     unsigned int sector_size, unsigned int num_fats,
+		     clus_t clu, clus_t next)
 {
 	__le32 v = cpu_to_le32(next);
+	off_t off0 = fat_off(fat_offset_sect, sector_size, clu);
 
-	if (pwrite(fd, &v, sizeof(v), fat_off(fat_offset_sect, sector_size, clu))
-	    != sizeof(v))
+	if (pwrite(fd, &v, sizeof(v), off0) != sizeof(v))
 		return -EIO;
+
+	if (num_fats == 2) {
+		off_t off1 = off0 + (off_t)fat_length_sect * sector_size;
+
+		if (pwrite(fd, &v, sizeof(v), off1) != sizeof(v))
+			return -EIO;
+	}
 	return 0;
 }
 
@@ -878,10 +930,15 @@ static int scan_directory(int fd, unsigned int sector_size,
 			  unsigned int cluster_size,
 			  unsigned int fat_offset_sect,
 			  unsigned int clu_offset_sect,
-			  clus_t dir_clu, struct chain_map *cm, int depth)
+			  clus_t dir_clu,
+			  bool dir_is_contiguous,
+			  unsigned long long dir_size,
+			  struct chain_map *cm, int depth)
 {
 	int dpc = (int)(cluster_size / sizeof(struct exfat_dentry));
 	clus_t clu = dir_clu;
+	clus_t dir_num_clus = dir_is_contiguous && dir_size
+		? (clus_t)((dir_size + cluster_size - 1) / cluster_size) : 0;
 	unsigned int linear_idx = 0;
 	int sec_remain = 0;
 	int saved_num_ext = 0;
@@ -937,7 +994,10 @@ static int scan_directory(int fd, unsigned int sector_size,
 								cluster_size,
 								fat_offset_sect,
 								clu_offset_sect,
-								head, cm,
+								head,
+								ce.is_contiguous,
+								ce.chain_size,
+								cm,
 								depth + 1);
 							if (ret)
 								return ret;
@@ -961,8 +1021,13 @@ static int scan_directory(int fd, unsigned int sector_size,
 					    ATTR_SUBDIR);
 		}
 
-		/* advance to next cluster via FAT */
-		{
+		/* advance to next cluster */
+		if (dir_is_contiguous) {
+			clus_t offset = clu - dir_clu + 1;
+
+			clu = (dir_num_clus && offset >= dir_num_clus)
+				? EXFAT_EOF_CLUSTER : clu + 1;
+		} else {
 			clus_t next;
 			int ret = read_fat(fd, fat_offset_sect, sector_size,
 					   clu, &next);
@@ -982,6 +1047,8 @@ static int normalize_contiguous_chain(int fd,
 				      unsigned int sector_size,
 				      unsigned int cluster_size,
 				      unsigned int fat_offset_sect,
+				      unsigned int fat_length_sect,
+				      unsigned int num_fats,
 				      unsigned int clu_offset_sect)
 {
 	unsigned long long num_clus;
@@ -1002,13 +1069,14 @@ static int normalize_contiguous_chain(int fd,
 	/* Write sequential FAT entries */
 	for (k = 0; k + 1 < num_clus; k++) {
 		c = ce->head + (clus_t)k;
-		ret = write_fat(fd, fat_offset_sect, sector_size, c, c + 1);
+		ret = write_fat(fd, fat_offset_sect, fat_length_sect,
+				sector_size, num_fats, c, c + 1);
 		if (ret)
 			return ret;
 	}
 	c = ce->head + (clus_t)(num_clus - 1);
-	ret = write_fat(fd, fat_offset_sect, sector_size, c,
-			EXFAT_EOF_CLUSTER);
+	ret = write_fat(fd, fat_offset_sect, fat_length_sect,
+			sector_size, num_fats, c, EXFAT_EOF_CLUSTER);
 	if (ret)
 		return ret;
 
@@ -1027,10 +1095,11 @@ static int normalize_contiguous_chain(int fd,
 				    fat_offset_sect, clu_offset_sect);
 }
 
-/* ── Helper: find upcase table start cluster ──────────────── */
+/* ── Helper: find upcase table start cluster and size ─────── */
 
 static int find_upcase_start_clu(int fd, const struct pbr *bs,
-				 clus_t *start_clu)
+				 clus_t *start_clu,
+				 unsigned long long *size_bytes)
 {
 	unsigned int sector_size  = EXFAT_SECTOR_SIZE(bs);
 	unsigned int cluster_size = EXFAT_CLUSTER_SIZE(bs);
@@ -1051,11 +1120,51 @@ static int find_upcase_start_clu(int fd, const struct pbr *bs,
 			break;
 		if (de.type == EXFAT_UPCASE) {
 			*start_clu = le32_to_cpu(de.upcase_start_clu);
+			if (size_bytes)
+				*size_bytes = le64_to_cpu(de.upcase_size);
 			return 0;
 		}
 	}
 	exfat_err("upcase table dentry not found in root directory\n");
 	return -EINVAL;
+}
+
+/*
+ * Walk the FAT chain starting at start_clu and return an error if any
+ * cluster in the chain is >= boundary.  Uses arithmetic for contiguous
+ * chains (fat[c] == 0) when is_contiguous is true.
+ */
+static int check_chain_in_bounds(int fd, unsigned int fat_offset_sect,
+				 unsigned int sector_size,
+				 clus_t start_clu, clus_t boundary,
+				 const char *name)
+{
+	clus_t clu = start_clu;
+
+	while (clu >= EXFAT_FIRST_CLUSTER && clu != EXFAT_EOF_CLUSTER) {
+		if (clu >= boundary) {
+			exfat_err("SHRINK BLOCKED — %s cluster %u is beyond "
+				  "new boundary\n", name, clu);
+			return -EINVAL;
+		}
+		{
+			clus_t next;
+			int ret = read_fat(fd, fat_offset_sect, sector_size,
+					   clu, &next);
+
+			if (ret)
+				return ret;
+			/*
+			 * A FAT entry of 0 (EXFAT_FREE_CLUSTER) for a cluster
+			 * that is part of a contiguous chain means there is no
+			 * chain beyond this point — treat it as EOF.
+			 */
+			if (next == EXFAT_FREE_CLUSTER)
+				break;
+			clu = next;
+		}
+	}
+	return 0;
 }
 
 /*
@@ -1071,7 +1180,9 @@ static int try_relocate(int fd, const struct pbr *bs,
 	unsigned int sector_size     = EXFAT_SECTOR_SIZE(bs);
 	unsigned int cluster_size    = EXFAT_CLUSTER_SIZE(bs);
 	unsigned int fat_offset_sect = le32_to_cpu(bs->bsx.fat_offset);
+	unsigned int fat_length_sect = le32_to_cpu(bs->bsx.fat_length);
 	unsigned int clu_offset_sect = le32_to_cpu(bs->bsx.clu_offset);
+	unsigned int num_fats        = bs->bsx.num_fats;
 	clus_t root_clu  = le32_to_cpu(bs->bsx.root_cluster);
 	clus_t boundary  = new_clu_count + EXFAT_FIRST_CLUSTER;
 
@@ -1092,16 +1203,23 @@ static int try_relocate(int fd, const struct pbr *bs,
 		return ret;
 
 	/* ── Find upcase start cluster ── */
-	ret = find_upcase_start_clu(fd, bs, &uc_start_clu);
+	ret = find_upcase_start_clu(fd, bs, &uc_start_clu, NULL);
 	if (ret)
 		return ret;
 
-	/* ── Guard: refuse if any metadata is itself beyond boundary ── */
-	if (bm_start_clu >= boundary || uc_start_clu >= boundary ||
-	    root_clu >= boundary) {
-		exfat_err("SHRINK BLOCKED — metadata beyond new boundary\n");
-		return -EINVAL;
-	}
+	/* ── Guard: walk full FAT chains of all metadata objects ── */
+	ret = check_chain_in_bounds(fd, fat_offset_sect, sector_size,
+				    bm_start_clu, boundary, "bitmap");
+	if (ret)
+		return ret;
+	ret = check_chain_in_bounds(fd, fat_offset_sect, sector_size,
+				    uc_start_clu, boundary, "upcase table");
+	if (ret)
+		return ret;
+	ret = check_chain_in_bounds(fd, fat_offset_sect, sector_size,
+				    root_clu, boundary, "root directory");
+	if (ret)
+		return ret;
 
 	bm_off = (off_t)clu_offset_sect * sector_size +
 		 (off_t)(bm_start_clu - EXFAT_FIRST_CLUSTER) * cluster_size;
@@ -1120,7 +1238,7 @@ static int try_relocate(int fd, const struct pbr *bs,
 	/* ── Phase 0: build chain map from directory tree ── */
 	ret = scan_directory(fd, sector_size, cluster_size,
 			     fat_offset_sect, clu_offset_sect,
-			     root_clu, &cm, 0);
+			     root_clu, false, 0, &cm, 0);
 	if (ret)
 		goto free_bmap;
 
@@ -1135,6 +1253,7 @@ static int try_relocate(int fd, const struct pbr *bs,
 		ret = normalize_contiguous_chain(fd, &cm.entries[i],
 						 sector_size, cluster_size,
 						 fat_offset_sect,
+						 fat_length_sect, num_fats,
 						 clu_offset_sect);
 		if (ret)
 			goto free_bmap;
@@ -1238,7 +1357,8 @@ static int try_relocate(int fd, const struct pbr *bs,
 			goto free_buf;
 
 		/* 3. Write fat[new] = successor */
-		ret = write_fat(fd, fat_offset_sect, sector_size, neu, succ);
+		ret = write_fat(fd, fat_offset_sect, fat_length_sect,
+				sector_size, num_fats, neu, succ);
 		if (ret)
 			goto free_buf;
 
@@ -1280,15 +1400,15 @@ static int try_relocate(int fd, const struct pbr *bs,
 					break;
 				}
 			}
-			ret = write_fat(fd, fat_offset_sect, sector_size,
-					eff_pred, neu);
+			ret = write_fat(fd, fat_offset_sect, fat_length_sect,
+					sector_size, num_fats, eff_pred, neu);
 			if (ret)
 				goto free_buf;
 		}
 
 		/* 4b. Clear old FAT entry */
-		ret = write_fat(fd, fat_offset_sect, sector_size, old,
-				EXFAT_FREE_CLUSTER);
+		ret = write_fat(fd, fat_offset_sect, fat_length_sect,
+				sector_size, num_fats, old, EXFAT_FREE_CLUSTER);
 		if (ret)
 			goto free_buf;
 
