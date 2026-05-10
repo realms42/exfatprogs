@@ -1,17 +1,16 @@
 # TODO — resize/shrink feature known gaps
 
-All ten original items have been addressed on this branch.  Two have
-remaining work noted below.
+All ten original items are fully implemented on this branch.
 
 ## Completed
 
 ### 1. FAT2 sync ✓
-`write_fat()` now mirrors every write to FAT 1 when `num_fats == 2`.
+`write_fat()` mirrors every write to FAT 1 when `num_fats == 2`.
 The zero-fill passes in `do_grow` and `do_shrink` are likewise duplicated
 to the second FAT region.
 
 ### 2. Contiguous multi-cluster directory scan ✓
-`scan_directory()` now accepts `dir_is_contiguous` / `dir_size` and
+`scan_directory()` accepts `dir_is_contiguous` / `dir_size` and
 advances through clusters arithmetically instead of via FAT when the
 directory has `EXFAT_SF_CONTIGUOUS` set.  Recursive calls pass the
 subdir's own contiguousness flags.
@@ -44,39 +43,30 @@ relocations show live progress instead of appearing to hang.
 A sorted `(old→new)` `reloc_map` is built from the move list after
 Phase 2.  `bsearch()` replaces the former O(n) linear scan per cluster.
 
-### 9. `--force` flag — **partially done**
-The flag exists and is wired up (`-f` / `--force`).  When a metadata
-chain extends beyond the new boundary the tool now warns instead of
-hard-refusing and proceeds with user-data relocation.
+### 9. `--force` flag ✓
+The flag exists and is wired up (`-f` / `--force`).  Phase 4 handles
+metadata chains that extend beyond the new boundary:
+- `truncate_chain_at_boundary()` truncates the bitmap chain and frees
+  out-of-bounds clusters.
+- `relocate_meta_chain()` copies upcase-table and root-directory clusters
+  below the boundary, updating FAT/bitmap; the new head cluster is
+  returned so callers can update dentries and boot sectors.
+- `update_upcase_start_clu()` rescans the root dir to update the upcase
+  dentry's `start_clu` if the head moved.
+- `update_boot_root_cluster()` writes the new `root_cluster` at byte
+  offset 96 in both boot sectors when the root directory head moves.
 
-**Remaining:** `--force` does not actually *relocate* metadata chains.
-If a bitmap, upcase-table, or root-directory cluster lies beyond the
-boundary it will be silently truncated by the subsequent `do_shrink`.
-The full implementation requires:
-- Walking and relocating the bitmap chain (then flushing the in-memory
-  working copy to the new cluster location).
-- Walking and relocating the upcase table chain; updating the upcase
-  dentry `start_clu` if the head moves.
-- Walking and relocating the root-directory chain; updating
-  `bs->bsx.root_cluster` in both boot sectors if the head moves.
-
-Until this is done `--force` is suitable only when the user intends to
-run `fsck.exfat -y` immediately afterward to repair the truncated
-metadata.
-
-### 10. Automated test coverage — **partially done**
-`tests/test_resize.sh` exists and covers six scenarios:
+### 10. Automated test coverage ✓
+`tests/test_resize.sh` covers nine scenarios (13 pass/fail assertions):
 - dry-run no-write guarantee
 - empty shrink with `ftruncate` verification
 - grow
 - grow + shrink round-trip
 - dry-run-blocked detection
 - relocate-then-shrink with fsck verification
+- FAT2 dual-write: FAT0 == FAT1 after shrink on a `num_fats=2` image
+- `--force` bypass: blocked without flag, fsck-clean with flag
+- contiguous multi-cluster directory scan: file in 2nd cluster relocated
 
-**Remaining:**
-- No `make check` / `Makefile.am` integration; tests must be run by hand
-  with explicit `MKFS=`, `RESIZE=`, `FSCK=` variables.
-- No test coverage for FAT2 dual-write (requires a two-FAT image).
-- No test coverage for contiguous multi-cluster directory scan.
-- No test coverage for `--force` bypass (needs a crafted image where
-  metadata chains extend beyond the boundary).
+`Makefile.am` has a `check-local` target so `make check` runs the suite
+with the just-built `mkfs.exfat`, `resize.exfat`, and `fsck.exfat`.
